@@ -1,0 +1,171 @@
+# documentation: https://docs.openreplay.com/en/deployment/deploy-docker/
+# slogan: OpenReplay is an open-source session replay and product analytics suite for developers.
+# category: analytics
+# tags: analytics, session-replay, monitoring, observability, openreplay
+# logo: svgs/openreplay.svg
+# port: 80
+
+services:
+  postgresql:
+    image: ghcr.io/openreplay/postgres:14.12.0-debian-12-r26
+    environment:
+      - POSTGRESQL_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
+    volumes:
+      - openreplay-pgdata:/bitnami/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=${SERVICE_PASSWORD_CLICKHOUSE}
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - openreplay-clickhouse:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: ghcr.io/openreplay/valkey:7.2.7-debian-12-r4
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+    volumes:
+      - openreplay-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${SERVICE_USER_MINIO}
+      - MINIO_ROOT_PASSWORD=${SERVICE_PASSWORD_MINIO}
+    volumes:
+      - openreplay-minio:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  chalice:
+    image: public.ecr.aws/p1t3u8a3/chalice:${OPENREPLAY_VERSION:-v1.22.0}
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - pg_host=postgresql
+      - pg_port=5432
+      - pg_dbname=postgres
+      - pg_user=postgres
+      - pg_password=${SERVICE_PASSWORD_POSTGRES}
+      - ch_host=clickhouse
+      - ch_port=9000
+      - ch_port_http=8123
+      - ch_username=default
+      - ch_password=${SERVICE_PASSWORD_CLICKHOUSE}
+      - REDIS_STRING=redis://redis:6379
+      - S3_HOST=http://minio:9000
+      - S3_KEY=${SERVICE_USER_MINIO}
+      - S3_SECRET=${SERVICE_PASSWORD_MINIO}
+      - jwt_secret=${SERVICE_PASSWORD_JWT}
+      - SITE_URL=${SERVICE_URL_FRONTEND_80}
+    volumes:
+      - openreplay-shared:/mnt/efs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  http:
+    image: public.ecr.aws/p1t3u8a3/http:${OPENREPLAY_VERSION:-v1.22.0}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - pg_host=postgresql
+      - pg_port=5432
+      - pg_dbname=postgres
+      - pg_user=postgres
+      - pg_password=${SERVICE_PASSWORD_POSTGRES}
+      - REDIS_STRING=redis://redis:6379
+      - S3_HOST=http://minio:9000
+      - S3_KEY=${SERVICE_USER_MINIO}
+      - S3_SECRET=${SERVICE_PASSWORD_MINIO}
+      - token_secret=${SERVICE_PASSWORD_TOKEN}
+    volumes:
+      - openreplay-shared:/mnt/efs
+
+  sink:
+    image: public.ecr.aws/p1t3u8a3/sink:${OPENREPLAY_VERSION:-v1.22.0}
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - REDIS_STRING=redis://redis:6379
+      - CLICKHOUSE_STRING=tcp://default:${SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:9000/default
+      - S3_HOST=http://minio:9000
+      - S3_KEY=${SERVICE_USER_MINIO}
+      - S3_SECRET=${SERVICE_PASSWORD_MINIO}
+    volumes:
+      - openreplay-shared:/mnt/efs
+
+  storage:
+    image: public.ecr.aws/p1t3u8a3/storage:${OPENREPLAY_VERSION:-v1.22.0}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - REDIS_STRING=redis://redis:6379
+      - S3_HOST=http://minio:9000
+      - S3_KEY=${SERVICE_USER_MINIO}
+      - S3_SECRET=${SERVICE_PASSWORD_MINIO}
+    volumes:
+      - openreplay-shared:/mnt/efs
+
+  frontend:
+    image: public.ecr.aws/p1t3u8a3/frontend:${OPENREPLAY_VERSION:-v1.22.0}
+    depends_on:
+      - chalice
+      - http
+    environment:
+      - SERVICE_URL_FRONTEND_80
+    volumes:
+      - openreplay-shared:/mnt/efs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  openreplay-pgdata:
+  openreplay-clickhouse:
+  openreplay-redis:
+  openreplay-minio:
+  openreplay-shared:
